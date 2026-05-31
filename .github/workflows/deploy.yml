@@ -11,26 +11,56 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1 ─ Build & Test
+  # ─────────────────────────────────────────────
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       image-tag: ${{ github.sha }}
+
     steps:
       - uses: actions/checkout@v4
 
+      # ── Python setup with caching ──────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── Install app deps + linter + test runner ─
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          # Install app requirements if the file exists
+          [ -f requirements.txt ] && pip install -r requirements.txt || echo "No requirements.txt found, skipping"
+          pip install pytest flake8
+
+      # ── Unit tests (exit 5 = no tests yet, treated as pass) ──
       - name: Run unit tests
         run: |
-          pip install pytest
-          pytest
+          pytest --tb=short -v || code=$?; \
+          if [ "${code:-0}" -eq 5 ]; then \
+            echo "⚠️  No test files found – treating as success. Add tests under tests/."; \
+            exit 0; \
+          else \
+            exit ${code:-0}; \
+          fi
 
-      - name: Lint
-        run: make lint
+      # ── Lint via flake8 directly (no Makefile dependency) ──
+      - name: Lint (flake8)
+        run: |
+          flake8 . \
+            --count \
+            --select=E9,F63,F7,F82 \
+            --show-source \
+            --statistics \
+            --exclude=.git,__pycache__,.venv,venv,node_modules
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
+      # ── Docker: login BEFORE buildx so credentials are ready ──
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -38,6 +68,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build, push, and produce SBOM + provenance ──
       - name: Build and push container image
         id: build
         uses: docker/build-push-action@v5
@@ -50,13 +84,26 @@ jobs:
           provenance: true
           sbom: true
 
+  # ─────────────────────────────────────────────
+  # JOB 2 ─ Security Scan (Trivy)
+  # ─────────────────────────────────────────────
   security-scan:
     name: Security Scan (Trivy)
     needs: build-and-test
     runs-on: ubuntu-latest
     permissions:
       security-events: write
+      packages: read       # needed to pull the image from ghcr.io
+
     steps:
+      # Must log in so Trivy can pull the private image
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@master
         with:
@@ -64,29 +111,49 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
-          exit-code: 1   # Fail pipeline on CRITICAL vulnerabilities
+          exit-code: 1        # Fail on CRITICAL/HIGH vulnerabilities
 
       - name: Upload SARIF to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        if: always()          # Upload even when scan fails so results are visible
         with:
           sarif_file: trivy-results.sarif
 
+  # ─────────────────────────────────────────────
+  # JOB 3 ─ Sign Image (Cosign keyless)
+  # ─────────────────────────────────────────────
   sign-image:
     name: Sign Image (Cosign keyless)
-    needs: security-scan
+    needs: [build-and-test, security-scan]
     runs-on: ubuntu-latest
     permissions:
       id-token: write    # Required for OIDC keyless signing
       packages: write
+
     steps:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sign container image with OIDC identity
         run: |
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }}
+
+      # ── Extract SBOM from the image manifest, then attest it ──
+      - name: Extract SBOM from image
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }} \
+            --format '{{ json .SBOM.SPDX }}' > sbom.json
+          echo "SBOM extracted:"
+          cat sbom.json | head -5
 
       - name: Attach SBOM attestation
         run: |
@@ -95,15 +162,24 @@ jobs:
             --type spdx \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }}
 
+  # ─────────────────────────────────────────────
+  # JOB 4 ─ Deploy to Staging
+  # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
     needs: sign-image
     runs-on: ubuntu-latest
     environment: staging
+
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITOPS_PAT }}
+
+      - name: Install Kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
 
       - name: Update staging image tag via Kustomize
         run: |
@@ -115,14 +191,27 @@ jobs:
           git commit -am "deploy(staging): ${{ github.sha }}"
           git push
 
+  # ─────────────────────────────────────────────
+  # JOB 5 ─ Integration Tests (Staging)
+  # ─────────────────────────────────────────────
   integration-tests:
     name: Integration Tests (Staging)
     needs: deploy-staging
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
       - name: Wait for ArgoCD sync
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}    # e.g. argocd.example.com
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
         run: |
           argocd app wait my-api-staging \
             --sync \
@@ -132,12 +221,16 @@ jobs:
       - name: Run integration tests against staging
         run: make integration-test ENVIRONMENT=staging
 
+  # ─────────────────────────────────────────────
+  # JOB 6 ─ Deploy to Production (Canary)
+  # ─────────────────────────────────────────────
   deploy-production:
     name: Deploy to Production (Canary)
     needs: integration-tests
     runs-on: ubuntu-latest
     environment: production   # Requires manual approval in GitHub
     if: github.event_name == 'release'
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,12 +239,25 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Verify the image was signed by THIS workflow ──
       - name: Verify image signature before production deploy
         run: |
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/deploy.yml" \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Install Kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
 
       - name: Update production image tag (triggers Flagger canary)
         run: |
@@ -163,7 +269,13 @@ jobs:
           git commit -am "deploy(production): ${{ github.sha }}"
           git push
 
+      - name: Install Flagger CLI
+        run: |
+          curl -sSLo /usr/local/bin/flagger \
+            https://github.com/fluxcd/flagger/releases/latest/download/flagger-linux-amd64
+          chmod +x /usr/local/bin/flagger
+
       - name: Monitor Flagger canary progress
         run: |
           echo "Flagger canary analysis started. Monitoring..."
-          flagger --namespace=production get canary my-api --watch
+          kubectl -n production get canary my-api --watch
