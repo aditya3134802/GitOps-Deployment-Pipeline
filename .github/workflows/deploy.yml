@@ -8,7 +8,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   # ─────────────────────────────────────────────
@@ -20,16 +19,24 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       image-tag: ${{ github.sha }}
+      image-name: ${{ steps.image-name.outputs.name }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # ── Python setup WITHOUT cache (avoids crash when requirements.txt is absent) ──
+      # ── Force image name to lowercase — fixes "must be lowercase" error ──────────
+      - name: Set lowercase image name
+        id: image-name
+        run: |
+          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "Image name: ${IMAGE_NAME}"
+
+      # ── Python setup WITHOUT cache (cache: pip crashes if requirements.txt missing)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          # NOTE: DO NOT add "cache: pip" here — it crashes if requirements.txt is missing
 
       # ── Install dependencies safely ──────────────────────────────────────────────
       - name: Install Python dependencies
@@ -39,10 +46,10 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            echo "No requirements.txt found — skipping app deps install"
+            echo "No requirements.txt — skipping"
           fi
 
-      # ── Unit tests — exit 5 means no tests found, treat as OK ────────────────────
+      # ── Unit tests — exit 5 = no tests found, treat as OK ────────────────────────
       - name: Run unit tests
         run: |
           pytest --tb=short -v
@@ -53,7 +60,7 @@ jobs:
           fi
           exit $EXIT_CODE
 
-      # ── Lint — uses flake8 directly, no Makefile required ────────────────────────
+      # ── Lint via flake8 directly — no Makefile needed ────────────────────────────
       - name: Lint (flake8)
         run: |
           flake8 . \
@@ -63,7 +70,7 @@ jobs:
             --statistics \
             --exclude=.git,__pycache__,.venv,venv,node_modules,.github
 
-      # ── Login BEFORE Buildx so credentials are ready ─────────────────────────────
+      # ── Login BEFORE Buildx ───────────────────────────────────────────────────────
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -74,14 +81,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── Build, push, generate SBOM + provenance attestations ─────────────────────
+      # ── Build & push using the lowercase image name ───────────────────────────────
       - name: Build and push container image
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          tags: ${{ steps.image-name.outputs.name }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
@@ -99,7 +106,6 @@ jobs:
       packages: read
 
     steps:
-      # Must log in — image is private on ghcr.io
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -110,7 +116,7 @@ jobs:
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          image-ref: ${{ needs.build-and-test.outputs.image-name }}:${{ github.sha }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
@@ -147,13 +153,12 @@ jobs:
       - name: Sign container image with OIDC identity
         run: |
           cosign sign --yes \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }}
+            ${{ needs.build-and-test.outputs.image-name }}@${{ needs.build-and-test.outputs.image-digest }}
 
-      # Extract the SBOM that was baked into the image manifest during build
       - name: Extract SBOM from image manifest
         run: |
           docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }} \
+            ${{ needs.build-and-test.outputs.image-name }}@${{ needs.build-and-test.outputs.image-digest }} \
             --format '{{ json .SBOM.SPDX }}' > sbom.json
           echo "SBOM extracted successfully"
 
@@ -162,14 +167,14 @@ jobs:
           cosign attest --yes \
             --predicate sbom.json \
             --type spdx \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-test.outputs.image-digest }}
+            ${{ needs.build-and-test.outputs.image-name }}@${{ needs.build-and-test.outputs.image-digest }}
 
   # ─────────────────────────────────────────────
   # JOB 4 — Deploy to Staging
   # ─────────────────────────────────────────────
   deploy-staging:
     name: Deploy to Staging
-    needs: sign-image
+    needs: [build-and-test, sign-image]
     runs-on: ubuntu-latest
     environment: staging
 
@@ -188,7 +193,7 @@ jobs:
         run: |
           cd gitops/staging
           kustomize edit set image \
-            app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            app=${{ needs.build-and-test.outputs.image-name }}:${{ github.sha }}
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "deploy(staging): ${{ github.sha }}"
@@ -251,12 +256,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Re-compute lowercase name (env vars not shared across jobs)
+      - name: Set lowercase image name
+        id: image-name
+        run: |
+          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+
       - name: Verify image signature before production deploy
         run: |
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/deploy.yml" \
             --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ steps.image-name.outputs.name }}:${{ github.sha }}
 
       - name: Install Kustomize
         run: |
@@ -268,7 +280,7 @@ jobs:
         run: |
           cd gitops/production
           kustomize edit set image \
-            app=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            app=${{ steps.image-name.outputs.name }}:${{ github.sha }}
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git commit -am "deploy(production): ${{ github.sha }}"
